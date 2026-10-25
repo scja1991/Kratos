@@ -128,7 +128,131 @@ paths. Build log: `build/logs/archive_fix_build.log`; test logs:
 The XML files and `build/logs/validation_summary.json` describe this correction run.
 
 No broad Core/StructuralMechanics suites, FE benchmark or performance harness was
-run in this correction. Voce, further physics and FE implementation remain outside
-this package. A small 3D FE demonstration with the new Swift law is the next step.
+run in that correction. Voce and further physics remain outside this package.
+The separate small FE lifecycle run below was added afterwards.
 The architecture, selection value and public archive contract remain proposals
 subject to maintainer review; no ABI or universal zero-cost claim is made.
+
+
+## Homogeneous 3D FE lifecycle and model restart (2026-10-25)
+
+`test_small_strain_swift_fe.py` is included in the small/nightly/all suites. It
+uses one registered `SmallDisplacementElement3D8N`, a straight 1 mm cube, and the
+existing `Materials.json` through `ReadMaterialsUtility`. Units are mm, N, MPa.
+All eight Gauss points are checked. Element registration is in StructuralMechanics
+`structural_mechanics_application.cpp:650`; `SmallDisplacement::UseElementProvidedStrain`
+returns true. The material definition adds no fracture energy or separate initial
+yield stress.
+
+Symmetry conditions prescribe ux=0 on x=0, uy=0 on y=0, uz=0 on z=0; ux is driven
+on x=1. The eight remaining transverse DOFs are solved by the standard
+`ResidualBasedNewtonRaphsonStrategy`, incremental static scheme, block builder,
+and Skyline LU. Mesh movement is disabled. The solver rebuilds the material
+stiffness during Newton. Only a converged SolveSolutionStep may be finalized.
+There is no prescribed analytical transverse displacement field.
+
+The full reference path is computed before the FE solve. Its independent scalar
+bisection uses `abs(E*(eps-ep_axial_old)) - E*dp - K*(eps0+p_old+dp)^n = 0`.
+The modulus here is E because the stress state is uniaxial; the reference does not
+use the 3G equation of the 3D elastic predictor. Accumulated p and signed axial
+plastic strain are distinct stored reference quantities, updated with dp and
+sign(trial)*dp respectively. Lateral strain is `-nu*sigma/E-ep_axial/2`; the plastic
+engineering vector is `[ep_axial,-ep_axial/2,-ep_axial/2,0,0,0]`.
+
+Positive tension gives a positive summed KM.REACTION_X on x=1 and a negative sum
+on x=0. Both signed sums are compared with +/-sigma times the ORIGINAL 1 mm^2
+area; their sum and all free-DOF reactions are checked. Independently assembling
+the element RHS checks the L2 equilibrium residual of the eight free DOFs.
+
+| Step | Axial strain | Expected phase | Global Newton iterations, A/B |
+| --- | --- | --- | --- |
+| 1 | 0.0005 | elastic | 1/— |
+| 2 | 0.0015 | elastic | 1/— |
+| 3 | 0.0020 | first plastic flow | 3/— |
+| 4 | 0.0030 | plastic loading | 2/— |
+| 5 | 0.0045 | plastic loading | 2/— |
+| 6 | 0.0060 | plastic loading / checkpoint | 2/— |
+| 7 | 0.0050 | elastic unloading | 1/1 |
+| 8 | 0.0045 | elastic unloading | 1/1 |
+| 9 | 0.0055 | elastic reloading | 1/1 |
+| 10 | 0.0060 | return to previous yield | 1/1 |
+| 11 | 0.0065 | renewed plastic flow | 2/2 |
+| 12 | 0.0080 | further plastic flow | 2/2 |
+
+The JSON distinguishes the converged trial response before FinalizeSolutionStep
+from committed history afterwards: `trial.stress/strain` describe the converged
+configuration, while `trial.p/plastic_strain` are still the committed inputs.
+These inputs remain unchanged through Newton and output queries. After normal
+strategy finalization all IP histories match the independent reference. During
+unloading/reloading p remains exactly unchanged; steps 11 and 12 increase it.
+Stress, strain and plastic state are checked for homogeneity at every IP.
+
+The binary restart uses the existing `FileSerializer` on the entire `Model` after
+step 6, at nonzero p approximately 0.00397306854. It includes nodes, DOFs/fixities,
+two solution-step buffers, properties, ProcessInfo, element data and all eight IP
+laws. The file lives in a fresh temporary directory for this test only. A new
+Model is loaded and its signature, including previous nodal buffers and nonzero
+history, is compared immediately. IS_RESTARTED and LOAD_RESTART are then set as
+in the core RestartUtility, and a NEW solver is initialized normally.
+`BaseSolidElement::Initialize` respects IS_RESTARTED; the second signature check
+verifies that loaded material history was not reset. No history is copied back
+manually. Steps 7-12 then compare both continuations, including trial/committed
+stress, strain, history, displacement and reaction. Iteration-count identity is
+not required, and no convergence-order claim is inferred from these few iterations.
+
+Acceptance limits were fixed before FE evaluation: absolute 1e-6 MPa for stress,
+1e-6 N for reaction, 1e-11 for strain/history and 1e-11 mm for displacement, plus
+1e-9 times the reference magnitude. Local stress resolution is about 1.5e-8 MPa
+for this C, so the stress/force allowances also cover global equilibrium and
+roundoff. Strain/history allowances cover stress-to-strain conversion and rounding.
+The normal ResidualCriteria uses relative 1e-10 and absolute 1e-9; the independent
+free-DOF L2 residual must additionally be <=1e-7 N. No tolerance was relaxed.
+
+Newly executed checks: standalone FE test 1/1, existing registration/material tests
+2/2, ConstitutiveLaws Python nightly 31/31 (includes these three), and diff --check.
+The 17/85 C++ results above are earlier evidence, not rerun for this Python-only
+addition. No native sources changed and no native rebuild was needed. Runtime
+paths and SHA256 hashes match the existing build/staged libraries of this worktree.
+Their build metadata records 8b7484c2ae7, when the prototype was uncommitted;
+the user subsequently committed that prototype as f282677a864 before this FE task.
+The provenance JSON records both revisions explicitly.
+
+| Maximum over all accepted A/B steps | Observed absolute error |
+| --- | ---: |
+| Axial stress [MPa] | 4.213291e-09 |
+| Transverse/shear stress [MPa] | 6.531309e-11 |
+| IP stress spread [MPa] | 8.810730e-13 |
+| Accumulated p | 2.006208e-14 |
+| Plastic strain, any component | 2.006208e-14 |
+| Total strain, any component | 4.013283e-15 |
+| Displacement [mm] | 4.013283e-15 |
+| Signed axial face reaction [N] | 4.212893e-09 |
+| Free-DOF L2 residual [N] | 4.611346e-11 |
+
+All 12 A steps and all 6 restarted B steps converged, with 1-3 global Newton
+iterations. Maximum A/B continuation differences in stress, strain, p, plastic
+strain, displacement and reaction were all 0.0 in this run. No production-law,
+integrator, solver or archive correction was required by the FE test.
+
+Separate reproduction from the worktree root:
+
+```bash
+export PYTHONPATH="$PWD/bin/Release"
+export LD_LIBRARY_PATH="$PWD/bin/Release/libs"
+export PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+KRATOS_SWIFT_FE_REPORT="$PWD/build/logs/swift_fe_validation.json" \
+  /usr/bin/python3 applications/ConstitutiveLawsApplication/tests/test_small_strain_swift_fe.py
+```
+
+The optional report is output only. The test never reads previous build/logs or
+files from earlier temporary runs. `swift_fe_validation.json` contains the fixed
+reference path, all IP/node outputs, signed reactions, global convergence records,
+checkpoint and error maxima. With the optional report enabled, the standard
+Newton strategy/criterion also prints its per-iteration residuals to the test log. `swift_fe_runtime_provenance.json` verifies native
+paths/hashes. `validation_summary.json` keeps previous results and this separate
+FE run. Test logs: `swift_fe_test.log`, `swift_fe_registration.log`,
+`swift_fe_python_suite.log` under build/logs.
+
+This homogeneous one-element case establishes the intended FE lifecycle and
+uniaxial response. It provides no general mesh, element-family or structural
+validation. Voce, mesh studies and performance/benchmark campaigns were not added.

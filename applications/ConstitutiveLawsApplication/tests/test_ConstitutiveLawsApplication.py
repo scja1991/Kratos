@@ -5,6 +5,7 @@ import KratosMultiphysics
 import KratosMultiphysics.KratosUnittest as KratosUnittest
 
 from test_small_strain_j2_hardening import TestSmallStrainJ2Hardening
+from test_small_strain_swift_fe import TestSmallStrainSwiftFE
 
 from test_perfect_plasticity_implementation_verification import TestPerfectPlasticityImplementationVerification
 
@@ -53,6 +54,7 @@ def AssembleTestSuites():
     # Create a test suit with the selected tests (Small tests):
     smallSuite = suites['small']
     smallSuite.addTests(KratosUnittest.TestLoader().loadTestsFromTestCase(TestSmallStrainJ2Hardening))
+    smallSuite.addTests(KratosUnittest.TestLoader().loadTestsFromTestCase(TestSmallStrainSwiftFE))
 
     smallSuite.addTest(SimpleSmallDeformationPlasticityVMTest('test_execution'))
     smallSuite.addTest(SimpleSmallDeformationPlasticityDPTest('test_execution'))
