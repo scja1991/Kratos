@@ -1,0 +1,18 @@
+{
+    "properties": [{
+        "model_part_name": "Structure",
+        "properties_id": 1,
+        "Material": {
+            "constitutive_law": {"name": "SmallStrainJ2IsotropicHardening3DLaw"},
+            "Variables": {
+                "YOUNG_MODULUS": 210000.0,
+                "POISSON_RATIO": 0.3,
+                "HARDENING_CURVE": 8,
+                "YIELD_STRESS": 250.0,
+                "EXPONENTIAL_SATURATION_YIELD_STRESS": 450.0,
+                "HARDENING_EXPONENT": 20.0
+            },
+            "Tables": {}
+        }
+    }]
+}

@@ -8,7 +8,8 @@ This is a local architecture proposal, without maintainer approval.
 `SWIFT_INITIAL_STRAIN`, and `SWIFT_HARDENING_EXPONENT`.
 `HARDENING_CURVE` is optional for this wrapper; if supplied it must be 7.
 The shared `SmallStrainJ2IsotropicHardening3DLaw` requires that explicit selection.
-Only Swift is implemented. Other selections are rejected.
+This branch also supports Voce through selection 8 in the shared family; see
+[VocePlasticity/README.md](../VocePlasticity/README.md). Other selections are rejected.
 
 The shared family owns accumulated plastic strain. Its explicit opt-in integrator
 solves six stress equations and yield consistency with a total plastic multiplier.

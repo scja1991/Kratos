@@ -29,20 +29,22 @@ FREE_RESIDUAL_LIMIT = 1.0e-7  # N: independently assembled free-DOF L2 norm.
 DISPLACEMENT_DOFS = (KM.DISPLACEMENT_X, KM.DISPLACEMENT_Y, KM.DISPLACEMENT_Z)
 
 
-def uniaxial_reference():
+def uniaxial_reference(hardening=None):
     """Signed axial plastic strain and accumulated p are independent histories."""
+    if hardening is None:
+        hardening = lambda p: COEFFICIENT * (INITIAL_STRAIN + p)**EXPONENT
     p = axial_plastic = 0.0
     result = []
     for strain in AXIAL_PATH:
         trial = YOUNG * (strain - axial_plastic)
-        yield_stress = COEFFICIENT * (INITIAL_STRAIN + p)**EXPONENT
+        yield_stress = hardening(p)
         delta_p = 0.0
         if abs(trial) > yield_stress:
             lower, upper = 0.0, (abs(trial) - yield_stress) / YOUNG
             for _ in range(120):
                 mid = 0.5 * (lower + upper)
                 residual = (abs(trial) - YOUNG * mid
-                            - COEFFICIENT * (INITIAL_STRAIN + p + mid)**EXPONENT)
+                            - hardening(p + mid))
                 if residual > 0.0:
                     lower = mid
                 else:
@@ -59,6 +61,18 @@ def uniaxial_reference():
 
 
 class TestSmallStrainSwiftFE(KratosUnittest.TestCase):
+    material_folder = "SwiftPlasticity"
+    law_name = "SmallStrainSwiftJ2Plasticity3DLaw"
+    report_variable = "KRATOS_SWIFT_FE_REPORT"
+    material_values = ((KM.YOUNG_MODULUS, YOUNG), (KM.POISSON_RATIO, POISSON),
+                       (CLA.SWIFT_COEFFICIENT, COEFFICIENT),
+                       (CLA.SWIFT_INITIAL_STRAIN, INITIAL_STRAIN),
+                       (CLA.SWIFT_HARDENING_EXPONENT, EXPONENT))
+    absent_properties = (CLA.HARDENING_CURVE, KM.FRACTURE_ENERGY, KM.YIELD_STRESS)
+
+    def _reference(self):
+        return uniaxial_reference()
+
     def _create_model(self):
         model = KM.Model()
         part = model.CreateModelPart("Structure")
@@ -71,16 +85,13 @@ class TestSmallStrainSwiftFE(KratosUnittest.TestCase):
         part.ProcessInfo[KM.TIME] = 0.0
         settings = KM.Parameters('{"Parameters": {"materials_filename": ""}}')
         settings["Parameters"]["materials_filename"].SetString(
-            str(Path(__file__).parent / "SwiftPlasticity" / "Materials.json"))
+            str(Path(__file__).parent / self.material_folder / "Materials.json"))
         KM.ReadMaterialsUtility(settings, model)
         properties = part.GetProperties()[1]
-        for variable, value in ((KM.YOUNG_MODULUS, YOUNG), (KM.POISSON_RATIO, POISSON),
-                                (CLA.SWIFT_COEFFICIENT, COEFFICIENT),
-                                (CLA.SWIFT_INITIAL_STRAIN, INITIAL_STRAIN),
-                                (CLA.SWIFT_HARDENING_EXPONENT, EXPONENT)):
+        for variable, value in self.material_values:
             self.assertEqual(properties[variable], value)
-        self.assertEqual(properties[KM.CONSTITUTIVE_LAW].Info(), "SmallStrainSwiftJ2Plasticity3DLaw")
-        for variable in (CLA.HARDENING_CURVE, KM.FRACTURE_ENERGY, KM.YIELD_STRESS):
+        self.assertEqual(properties[KM.CONSTITUTIVE_LAW].Info(), self.law_name)
+        for variable in self.absent_properties:
             self.assertFalse(properties.Has(variable))
         coordinates = ((0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0),
                        (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1))
@@ -104,7 +115,7 @@ class TestSmallStrainSwiftFE(KratosUnittest.TestCase):
         linear_solver = KM.SkylineLUFactorizationSolver()
         builder = KM.ResidualBasedBlockBuilderAndSolver(linear_solver)
         criterion = KM.ResidualCriteria(1.0e-10, 1.0e-9)
-        echo_level = int(bool(os.environ.get("KRATOS_SWIFT_FE_REPORT")))
+        echo_level = int(bool(os.environ.get(self.report_variable)))
         criterion.SetEchoLevel(echo_level)
         strategy = KM.ResidualBasedNewtonRaphsonStrategy(
             part, scheme, criterion, builder, 25, True, False, False)
@@ -230,9 +241,7 @@ class TestSmallStrainSwiftFE(KratosUnittest.TestCase):
                            "displacement_buffer": [list(n.GetSolutionStepValue(KM.DISPLACEMENT, i)) for i in range(2)],
                            "reaction_buffer": [list(n.GetSolutionStepValue(KM.REACTION, i)) for i in range(2)]}
                           for n in part.Nodes],
-                "properties": [part.GetProperties()[1][v] for v in (
-                    KM.YOUNG_MODULUS, KM.POISSON_RATIO, CLA.SWIFT_COEFFICIENT,
-                    CLA.SWIFT_INITIAL_STRAIN, CLA.SWIFT_HARDENING_EXPONENT)],
+                "properties": [part.GetProperties()[1][variable] for variable, _ in self.material_values],
                 "law": part.GetProperties()[1][KM.CONSTITUTIVE_LAW].Info()}
 
     def _error_maxima(self, part, records):
@@ -271,12 +280,12 @@ class TestSmallStrainSwiftFE(KratosUnittest.TestCase):
         return errors
 
     def test_uniaxial_path_and_model_restart(self):
-        reference = uniaxial_reference()  # The entire reference exists before FE.
+        reference = self._reference()  # The entire reference exists before FE.
         model = self._create_model()
         part = model["Structure"]
         strategy = self._create_solver(part)
         uninterrupted = []
-        with tempfile.TemporaryDirectory(prefix="swift_fe_restart_") as folder:
+        with tempfile.TemporaryDirectory(prefix="j2_fe_restart_") as folder:
             archive = str(Path(folder) / "checkpoint")
             for step, expected in enumerate(reference, 1):
                 uninterrupted.append(self._solve_step(part, strategy, step, expected))
@@ -319,9 +328,9 @@ class TestSmallStrainSwiftFE(KratosUnittest.TestCase):
                         a = [x for row in a for x in row]
                         b = [x for row in b for x in row]
                     restart_errors[key] = max(restart_errors[key], max(abs(x-y) for x, y in zip(a, b)))
-        output = os.environ.get("KRATOS_SWIFT_FE_REPORT")
+        output = os.environ.get(self.report_variable)
         if output:
-            Path(output).write_text(json.dumps({"element": "SmallDisplacementElement3D8N",
+            Path(output).write_text(json.dumps({"material_folder": self.material_folder, "element": "SmallDisplacementElement3D8N",
                 "units": {"length": "mm", "force": "N", "stress": "MPa"},
                 "tolerances": {"relative": RELATIVE_TOLERANCE, "stress": STRESS_ABSOLUTE,
                     "reaction": REACTION_ABSOLUTE, "state": STATE_ABSOLUTE,

@@ -110,7 +110,8 @@ class GenericConstitutiveLawIntegratorPlasticity
         CurveFittingHardening = 4,
         LinearExponentialSoftening = 5,
         CurveDefinedByPoints = 6,
-        Swift = 7
+        Swift = 7,
+        Voce = 8
     };
 
     ///@}

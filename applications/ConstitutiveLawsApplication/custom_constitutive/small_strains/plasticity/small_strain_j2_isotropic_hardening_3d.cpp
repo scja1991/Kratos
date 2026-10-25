@@ -2,6 +2,7 @@
 #include "small_strain_j2_isotropic_hardening_3d.h"
 #include <cstdint>
 #include "custom_constitutive/auxiliary_files/hardening_laws/swift_hardening_law.h"
+#include "custom_constitutive/auxiliary_files/hardening_laws/voce_hardening_law.h"
 
 namespace Kratos
 {
@@ -20,9 +21,10 @@ SmallStrainJ2IsotropicHardening3D::Integrator::HardeningCurveType
 SmallStrainJ2IsotropicHardening3D::ResolveHardening(const Properties& rProperties) const
 {
     KRATOS_ERROR_IF_NOT(rProperties.Has(HARDENING_CURVE)) << "J2 hardening family requires HARDENING_CURVE";
-    KRATOS_ERROR_IF(rProperties[HARDENING_CURVE] != static_cast<int>(Integrator::HardeningCurveType::Swift))
+    const auto curve = static_cast<Integrator::HardeningCurveType>(rProperties[HARDENING_CURVE]);
+    KRATOS_ERROR_IF(curve != Integrator::HardeningCurveType::Swift && curve != Integrator::HardeningCurveType::Voce)
         << "Unsupported HARDENING_CURVE in J2 hardening family: " << rProperties[HARDENING_CURVE];
-    return Integrator::HardeningCurveType::Swift;
+    return curve;
 }
 
 SmallStrainJ2IsotropicHardening3D::Integrator::EvolutionContext
@@ -31,6 +33,8 @@ SmallStrainJ2IsotropicHardening3D::MakeEvolutionContext(const Properties& rPrope
     switch (ResolveHardening(rProperties)) {
         case Integrator::HardeningCurveType::Swift:
             return {rProperties, &SwiftHardeningLaw::TryCalculateStressThreshold, &EvaluateFlow, &EvaluateHistory};
+        case Integrator::HardeningCurveType::Voce:
+            return {rProperties, &VoceHardeningLaw::TryCalculateStressThreshold, &EvaluateFlow, &EvaluateHistory};
         default:
             KRATOS_ERROR << "Unsupported hardening selection";
     }
@@ -46,16 +50,24 @@ int SmallStrainJ2IsotropicHardening3D::Check(const Properties& rProperties,
     ElasticIsotropic3D::Check(rProperties, rGeometry, rInfo);
     KRATOS_ERROR_IF(rGeometry.WorkingSpaceDimension() != 3 || rGeometry.LocalSpaceDimension() != 3)
         << "J2 hardening requires a 3D solid geometry";
-    switch (ResolveHardening(rProperties)) {
+    const auto check_constant = [&rProperties](const Variable<double>& rVariable) {
+        KRATOS_ERROR_IF(rProperties.HasAccessor(rVariable) || rProperties.HasTable(TEMPERATURE, rVariable))
+            << "J2 hardening supports constant isothermal properties only: " << rVariable.Name();
+    };
+    for (const auto* p_variable : {&YOUNG_MODULUS, &POISSON_RATIO}) check_constant(*p_variable);
+    const auto curve = ResolveHardening(rProperties);
+    switch (curve) {
         case Integrator::HardeningCurveType::Swift:
             SwiftHardeningLaw::Check(rProperties);
+            for (const auto* p_variable : {&SWIFT_COEFFICIENT, &SWIFT_INITIAL_STRAIN, &SWIFT_HARDENING_EXPONENT})
+                check_constant(*p_variable);
+            break;
+        case Integrator::HardeningCurveType::Voce:
+            VoceHardeningLaw::Check(rProperties);
+            for (const auto* p_variable : {&YIELD_STRESS, &EXPONENTIAL_SATURATION_YIELD_STRESS,
+                &HARDENING_EXPONENT, &ISOTROPIC_HARDENING_MODULUS}) check_constant(*p_variable);
             break;
         default: KRATOS_ERROR << "Unsupported hardening selection";
-    }
-    for (const auto* p_variable : {&YOUNG_MODULUS, &POISSON_RATIO, &SWIFT_COEFFICIENT,
-        &SWIFT_INITIAL_STRAIN, &SWIFT_HARDENING_EXPONENT}) {
-        KRATOS_ERROR_IF(rProperties.HasAccessor(*p_variable) || rProperties.HasTable(TEMPERATURE, *p_variable))
-            << "J2 hardening supports constant isothermal properties only: " << p_variable->Name();
     }
     KRATOS_ERROR_IF(rProperties.Has(THERMAL_EXPANSION_COEFFICIENT)) << "Thermal J2 hardening is not supported";
     KRATOS_ERROR_IF(rProperties.Has(TANGENT_OPERATOR_ESTIMATION) && rProperties[TANGENT_OPERATOR_ESTIMATION] != 0)
@@ -68,9 +80,12 @@ int SmallStrainJ2IsotropicHardening3D::Check(const Properties& rProperties,
         << "Initial hardening is not representable";
     for (const auto* p_variable : {&YIELD_STRESS, &YIELD_STRESS_TENSION, &YIELD_STRESS_COMPRESSION}) {
         if (rProperties.Has(*p_variable)) {
+            check_constant(*p_variable);
             const double value = rProperties[*p_variable];
             KRATOS_ERROR_IF(!std::isfinite(value) || std::abs(value - initial_yield) > 1.0e-12 * initial_yield)
-                << "Redundant yield stress conflicts with Swift initial yield: " << p_variable->Name();
+                << "Redundant yield stress conflicts with "
+                << (curve == Integrator::HardeningCurveType::Swift ? "Swift" : "Voce")
+                << " initial yield: " << p_variable->Name();
         }
     }
     return 0;
