@@ -26,6 +26,20 @@ namespace Kratos
 {
 
 template<SizeType TVoigtSize>
+double AdvancedConstitutiveLawUtilities<TVoigtSize>::CalculateEquivalentPlasticStrainIncrement(const Vector& rIncrement)
+{
+    KRATOS_ERROR_IF(TVoigtSize != 6 || rIncrement.size() != 6)
+        << "Equivalent plastic increment requires complete 3D engineering strain";
+    double length = 0.0;
+    for (SizeType i = 0; i < 6; ++i) {
+        KRATOS_ERROR_IF_NOT(std::isfinite(rIncrement[i])) << "Nonfinite plastic increment";
+        length = std::hypot(length, rIncrement[i] * std::sqrt(i < 3 ? 2.0 / 3.0 : 1.0 / 3.0));
+    }
+    KRATOS_ERROR_IF_NOT(std::isfinite(length)) << "Plastic increment norm is not representable";
+    return length;
+}
+
+template<SizeType TVoigtSize>
 void AdvancedConstitutiveLawUtilities<TVoigtSize>::CalculateI2Invariant(
     const BoundedVectorType& rStressVector,
     double& rI2

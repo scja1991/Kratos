@@ -32,6 +32,7 @@
 #include "custom_constitutive/finite_strains/hyperelasticity/hyper_elastic_isotropic_neo_hookean_plane_strain_2d.h"
 #include "custom_constitutive/small_strains/linear/linear_elastic_orthotropic_2D_law.h"
 #include "custom_constitutive/small_strains/plasticity/small_strain_j2_plasticity_3d.h"
+#include "custom_constitutive/small_strains/plasticity/small_strain_swift_j2_plasticity_3d.h"
 #include "custom_constitutive/small_strains/plasticity/small_strain_j2_plasticity_plane_strain_2d.h"
 #include "custom_constitutive/small_strains/damage/small_strain_isotropic_damage_3d.h"
 #include "custom_constitutive/small_strains/damage/small_strain_isotropic_damage_implex_3d.h"
@@ -196,6 +197,13 @@ void AddCustomConstitutiveLawsToPython(pybind11::module& m)
     py::class_< SmallStrainJ2PlasticityPlaneStrain2D, typename SmallStrainJ2PlasticityPlaneStrain2D::Pointer,  ConstitutiveLaw >
     (m,"SmallStrainJ2PlasticityPlaneStrain2DLaw").def(py::init<>())
     ;
+
+    py::class_<SmallStrainJ2IsotropicHardening3D, SmallStrainJ2IsotropicHardening3D::Pointer, ConstitutiveLaw>
+        (m, "SmallStrainJ2IsotropicHardening3DLaw", "Isothermal 3D J2 endpoint plasticity with explicit hardening selection.").def(py::init<>())
+        .def("SetPlasticState", &SmallStrainJ2IsotropicHardening3D::SetPlasticState,
+            "Import the engineering plastic strain and independent accumulated history atomically.");
+    py::class_<SmallStrainSwiftJ2Plasticity3D, SmallStrainSwiftJ2Plasticity3D::Pointer, SmallStrainJ2IsotropicHardening3D>
+        (m, "SmallStrainSwiftJ2Plasticity3DLaw", "Swift wrapper; HARDENING_CURVE is optional.").def(py::init<>());
 
     py::class_< SmallStrainJ2Plasticity3D, typename SmallStrainJ2Plasticity3D::Pointer,  ConstitutiveLaw >
     (m,"SmallStrainJ2Plasticity3DLaw").def(py::init<>())

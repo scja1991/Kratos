@@ -244,6 +244,9 @@ class KRATOS_API(CONSTITUTIVE_LAWS_APPLICATION) AdvancedConstitutiveLawUtilities
      */
     static double CalculateCharacteristicLength(const GeometryType& rGeometry);
 
+    /// Full 3D engineering strain norm sqrt(2/3 * e:e); no history mutation.
+    static double CalculateEquivalentPlasticStrainIncrement(const Vector& rIncrement);
+
     /**
      * @brief Calculates the maximal distance between corner node of a geometry and its center (on reference configuration)
      * @param rGeometry The geometry to compute

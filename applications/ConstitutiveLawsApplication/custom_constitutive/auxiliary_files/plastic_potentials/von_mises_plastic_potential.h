@@ -12,6 +12,7 @@
 //
 
 #pragma once
+#include <cmath>
 
 // System includes
 
@@ -112,6 +113,34 @@ public:
         const double c2 = std::sqrt(3.0);
 
         noalias(rGFlux) = c2 * second_vector;
+    }
+
+    /** @brief Opt-in gradient and Hessian in stress/engineering-strain Voigt.
+     * Requires q from this stress, q > 0. No absolute stress-unit cutoff.
+     * Existing potential methods and callers are intentionally unchanged.
+     */
+    static bool CalculatePlasticPotentialDerivativeAndJacobian(
+        const array_1d<double, VoigtSize>& rStress, double Q,
+        array_1d<double, VoigtSize>& rG, Matrix& rDG)
+    {
+        if (VoigtSize != 6 || !std::isfinite(Q) || Q <= 0.0) return false;
+        const double mean = rStress[0] / 3.0 + rStress[1] / 3.0 + rStress[2] / 3.0;
+        for (SizeType i = 0; i < VoigtSize; ++i) {
+            const double deviator = rStress[i] - (i < 3 ? mean : 0.0);
+            rG[i] = (i < 3 ? 1.5 : 3.0) * (deviator / Q);
+            if (!std::isfinite(rG[i])) return false;
+        }
+        rDG.resize(VoigtSize, VoigtSize, false);
+        for (SizeType i = 0; i < VoigtSize; ++i) {
+            for (SizeType j = 0; j < VoigtSize; ++j) {
+                const double metric_projector = i < 3 && j < 3
+                    ? (i == j ? 2.0 / 3.0 : -1.0 / 3.0)
+                    : (i == j ? 2.0 : 0.0);
+                rDG(i,j) = (1.5 * metric_projector - rG[i] * rG[j]) / Q;
+                if (!std::isfinite(rDG(i,j))) return false;
+            }
+        }
+        return true;
     }
 
     /**

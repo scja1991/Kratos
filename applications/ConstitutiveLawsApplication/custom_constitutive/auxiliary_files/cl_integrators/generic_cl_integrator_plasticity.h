@@ -16,6 +16,10 @@
 #pragma once
 
 // System includes
+#include <algorithm>
+#include <cmath>
+#include <optional>
+#include <boost/numeric/ublas/lu.hpp>
 
 // Project includes
 #include "includes/define.h"
@@ -105,12 +109,301 @@ class GenericConstitutiveLawIntegratorPlasticity
         PerfectPlasticity = 3,
         CurveFittingHardening = 4,
         LinearExponentialSoftening = 5,
-        CurveDefinedByPoints = 6
+        CurveDefinedByPoints = 6,
+        Swift = 7
     };
 
     ///@}
     ///@name Life Cycle
     ///@{
+
+
+    /** @brief Explicit opt-in endpoint integration. No legacy caller uses this interface.
+     * Stress has tensor shear, strain/flow engineering shear. The context is borrowed
+     * for this call only. A failed result contains diagnostics but no candidate.
+     */
+    struct TrialInput
+    {
+        array_1d<double, VoigtSize> PredictorStress = ZeroVector(VoigtSize);
+        Vector EffectiveStrain = ZeroVector(VoigtSize);
+        array_1d<double, VoigtSize> CommittedPlasticStrain = ZeroVector(VoigtSize);
+        Matrix ElasticMatrix = ZeroMatrix(VoigtSize, VoigtSize);
+        double CommittedP = 0.0;
+        int MaxIterations = 100;
+        bool NeedTangent = false;
+    };
+
+    struct FlowLinearization
+    {
+        array_1d<double, VoigtSize> F = ZeroVector(VoigtSize);
+        array_1d<double, VoigtSize> G = ZeroVector(VoigtSize);
+        Matrix DG = ZeroMatrix(VoigtSize, VoigtSize);
+    };
+
+    struct HistoryResponse
+    {
+        double P = 0.0;
+        double DPLambda = 0.0; // Partial derivative at fixed stress.
+        array_1d<double, VoigtSize> DPStress = ZeroVector(VoigtSize);
+    };
+
+    struct EvolutionContext
+    {
+        const Properties& rProperties;
+        bool (*Hardening)(const Properties&, double, double&, double&);
+        bool (*Flow)(const array_1d<double, VoigtSize>&, double, FlowLinearization&);
+        bool (*History)(double, double, const FlowLinearization&, HistoryResponse&);
+    };
+
+    enum class IntegrationStatus { Elastic, Converged, NoConvergence };
+    enum class IntegrationFailure {
+        None, UnresolvedStress, NonFiniteState, SingularJacobian, LineSearch, IterationLimit
+    };
+
+    struct IntegrationCandidate
+    {
+        array_1d<double, VoigtSize> Stress = ZeroVector(VoigtSize);
+        array_1d<double, VoigtSize> PlasticIncrement = ZeroVector(VoigtSize);
+        array_1d<double, VoigtSize> PlasticStrain = ZeroVector(VoigtSize);
+        double P = 0.0;
+        double DeltaLambda = 0.0;
+        double Threshold = 0.0;
+        double Hardening = 0.0;
+        double EquivalentStress = 0.0;
+        std::optional<Matrix> Tangent;
+    };
+
+    struct IntegrationResult
+    {
+        IntegrationStatus Status = IntegrationStatus::NoConvergence;
+        IntegrationFailure Failure = IntegrationFailure::None;
+        int Iterations = 0;
+        double StressResidual = 0.0;
+        double YieldResidual = 0.0;
+        double StressTolerance = 0.0;
+        std::optional<IntegrationCandidate> Candidate;
+    };
+
+    static IntegrationResult IntegrateStressVectorWithHistory(
+        const TrialInput& rInput,
+        const EvolutionContext& rContext,
+        ConstitutiveLaw::Parameters& rValues)
+    {
+        constexpr SizeType n = VoigtSize;
+        constexpr double eps = std::numeric_limits<double>::epsilon();
+        KRATOS_ERROR_IF(n != 6) << "Endpoint hardening requires complete 3D strain";
+        KRATOS_ERROR_IF(rInput.MaxIterations <= 0 || rInput.EffectiveStrain.size() != n ||
+            rInput.ElasticMatrix.size1() != n || rInput.ElasticMatrix.size2() != n)
+            << "Invalid endpoint integration input";
+        KRATOS_ERROR_IF(!rContext.Hardening || !rContext.Flow || !rContext.History)
+            << "Missing endpoint evolution callback";
+        KRATOS_ERROR_IF(!std::isfinite(rInput.CommittedP) || rInput.CommittedP < 0.0)
+            << "Invalid committed accumulated plastic strain";
+        double c_scale = 0.0;
+        double strain_scale = 1.0;
+        double predictor_scale = 0.0;
+        for (SizeType i = 0; i < n; ++i) {
+            KRATOS_ERROR_IF(!std::isfinite(rInput.PredictorStress[i]) ||
+                !std::isfinite(rInput.CommittedPlasticStrain[i]) ||
+                !std::isfinite(rInput.EffectiveStrain[i])) << "Nonfinite endpoint input";
+            double row_sum = 0.0;
+            for (SizeType j = 0; j < n; ++j) {
+                KRATOS_ERROR_IF_NOT(std::isfinite(rInput.ElasticMatrix(i,j))) << "Nonfinite elasticity";
+                row_sum += std::abs(rInput.ElasticMatrix(i,j));
+            }
+            c_scale = std::max(c_scale, row_sum);
+            strain_scale = std::max({strain_scale, std::abs(rInput.EffectiveStrain[i]),
+                std::abs(rInput.CommittedPlasticStrain[i])});
+            predictor_scale = std::max(predictor_scale, std::abs(rInput.PredictorStress[i]));
+        }
+        KRATOS_ERROR_IF(!std::isfinite(c_scale) || c_scale <= 0.0) << "Invalid elastic scale";
+        double initial_threshold = 0.0, initial_hardening = 0.0;
+        KRATOS_ERROR_IF_NOT(rContext.Hardening(rContext.rProperties, rInput.CommittedP,
+            initial_threshold, initial_hardening)) << "Committed hardening is not representable";
+        KRATOS_ERROR_IF(!std::isfinite(initial_threshold) || initial_threshold <= 0.0 ||
+            !std::isfinite(initial_hardening) || initial_hardening < 0.0) << "Invalid hardening response";
+        double trial_q = 0.0;
+        YieldSurfaceType::CalculateEquivalentStress(rInput.PredictorStress,
+            rInput.EffectiveStrain, trial_q, rValues);
+        IntegrationResult result;
+        if (!std::isfinite(trial_q)) {
+            result.Failure = IntegrationFailure::NonFiniteState;
+            return result;
+        }
+        const double stress_scale = std::max(initial_threshold, trial_q);
+        const double lambda_scale = stress_scale / c_scale;
+        result.StressTolerance = std::max(1.0e-12 * stress_scale,
+            128.0 * eps * std::max({stress_scale, predictor_scale, c_scale * strain_scale}));
+        if (!std::isfinite(result.StressTolerance) || result.StressTolerance > 1.0e-6 * initial_threshold ||
+            !std::isfinite(lambda_scale) || lambda_scale <= 0.0) {
+            result.Failure = IntegrationFailure::UnresolvedStress;
+            return result;
+        }
+        result.YieldResidual = trial_q - initial_threshold;
+        if (result.YieldResidual <= result.StressTolerance) {
+            IntegrationCandidate candidate;
+            candidate.Stress = rInput.PredictorStress;
+            candidate.PlasticStrain = rInput.CommittedPlasticStrain;
+            candidate.P = rInput.CommittedP;
+            candidate.Threshold = initial_threshold;
+            candidate.Hardening = initial_hardening;
+            candidate.EquivalentStress = trial_q;
+            if (rInput.NeedTangent) candidate.Tangent = rInput.ElasticMatrix;
+            result.Candidate = std::move(candidate);
+            result.Status = IntegrationStatus::Elastic;
+            return result;
+        }
+        const double q_min = 32.0 * eps * std::max(stress_scale, predictor_scale);
+        struct Evaluation {
+            FlowLinearization Flow;
+            HistoryResponse History;
+            double Q = 0.0, Threshold = 0.0, Hardening = 0.0;
+            Vector Residual = ZeroVector(n + 1);
+            Matrix Jacobian = ZeroMatrix(n + 1, n + 1);
+        };
+        auto evaluate = [&](const array_1d<double,n>& rStress, double Lambda, Evaluation& rEval) {
+            if (!std::isfinite(Lambda) || Lambda < 0.0) return false;
+            for (double value : rStress) if (!std::isfinite(value)) return false;
+            YieldSurfaceType::CalculateEquivalentStress(rStress, rInput.EffectiveStrain, rEval.Q, rValues);
+            if (!std::isfinite(rEval.Q) || rEval.Q <= q_min ||
+                !rContext.Flow(rStress, rEval.Q, rEval.Flow) ||
+                !rContext.History(rInput.CommittedP, Lambda, rEval.Flow, rEval.History)) return false;
+            if (rEval.Flow.DG.size1() != n || rEval.Flow.DG.size2() != n) return false;
+            if (!std::isfinite(rEval.History.P) || rEval.History.P < rInput.CommittedP ||
+                !std::isfinite(rEval.History.DPLambda) || rEval.History.DPLambda < 0.0 ||
+                !rContext.Hardening(rContext.rProperties, rEval.History.P, rEval.Threshold, rEval.Hardening) ||
+                !std::isfinite(rEval.Threshold) || rEval.Threshold <= 0.0 ||
+                !std::isfinite(rEval.Hardening) || rEval.Hardening < 0.0) return false;
+            const Vector elastic_flow = prod(rInput.ElasticMatrix, rEval.Flow.G);
+            const Matrix elastic_dg = prod(rInput.ElasticMatrix, rEval.Flow.DG);
+            for (SizeType i = 0; i < n; ++i) {
+                rEval.Residual[i] = rStress[i] - rInput.PredictorStress[i] + Lambda * elastic_flow[i];
+                for (SizeType j = 0; j < n; ++j)
+                    rEval.Jacobian(i,j) = (i == j ? 1.0 : 0.0) + Lambda * elastic_dg(i,j);
+                rEval.Jacobian(i,n) = elastic_flow[i];
+                rEval.Jacobian(n,i) = rEval.Flow.F[i] - rEval.Hardening * rEval.History.DPStress[i];
+            }
+            rEval.Residual[n] = rEval.Q - rEval.Threshold;
+            rEval.Jacobian(n,n) = -rEval.Hardening * rEval.History.DPLambda;
+            for (double value : rEval.Residual) if (!std::isfinite(value)) return false;
+            for (double value : rEval.Jacobian.data()) if (!std::isfinite(value)) return false;
+            return true;
+        };
+        // Column scaling: stress / stress_scale, lambda / lambda_scale. All rows
+        // are stress residuals divided by stress_scale. Solve, never invert.
+        auto solve = [&](const Matrix& rJacobian, const Matrix& rRhs, Matrix& rSolution) {
+            Matrix scaled(n + 1, n + 1);
+            double matrix_norm = 0.0;
+            for (SizeType i = 0; i <= n; ++i) {
+                double row_sum = 0.0;
+                for (SizeType j = 0; j <= n; ++j) {
+                    scaled(i,j) = rJacobian(i,j) * (j < n ? stress_scale : lambda_scale) / stress_scale;
+                    row_sum += std::abs(scaled(i,j));
+                }
+                matrix_norm = std::max(matrix_norm, row_sum);
+            }
+            Matrix factors = scaled;
+            boost::numeric::ublas::permutation_matrix<SizeType> permutation(n + 1);
+            if (boost::numeric::ublas::lu_factorize(factors, permutation) != 0) return false;
+            for (SizeType i = 0; i <= n; ++i)
+                if (!std::isfinite(factors(i,i)) || std::abs(factors(i,i)) <= 64.0 * eps * std::max(1.0, matrix_norm)) return false;
+            rSolution = rRhs;
+            boost::numeric::ublas::lu_substitute(factors, permutation, rSolution);
+            const Matrix error = prod(scaled, rSolution) - rRhs;
+            for (double value : rSolution.data()) if (!std::isfinite(value)) return false;
+            return norm_inf(error) <= 1024.0 * eps *
+                (matrix_norm * norm_inf(rSolution) + norm_inf(rRhs) + std::numeric_limits<double>::min());
+        };
+        auto merit = [&](const Evaluation& rEval) {
+            double value = 0.0;
+            for (double residual : rEval.Residual) value += std::pow(residual / stress_scale, 2);
+            return 0.5 * value;
+        };
+        array_1d<double,n> stress = rInput.PredictorStress;
+        double lambda = 0.0;
+        Evaluation current;
+        if (!evaluate(stress, lambda, current)) {
+            result.Failure = IntegrationFailure::NonFiniteState;
+            return result;
+        }
+        while (true) {
+            result.StressResidual = 0.0;
+            for (SizeType i = 0; i < n; ++i)
+                result.StressResidual = std::max(result.StressResidual, std::abs(current.Residual[i]));
+            result.YieldResidual = current.Residual[n];
+            if (result.StressResidual <= result.StressTolerance &&
+                std::abs(result.YieldResidual) <= result.StressTolerance) break;
+            if (result.Iterations == rInput.MaxIterations) {
+                result.Failure = IntegrationFailure::IterationLimit;
+                return result;
+            }
+            Matrix rhs(n + 1, 1), step;
+            for (SizeType i = 0; i <= n; ++i) rhs(i,0) = -current.Residual[i] / stress_scale;
+            if (!solve(current.Jacobian, rhs, step)) {
+                result.Failure = IntegrationFailure::SingularJacobian;
+                return result;
+            }
+            bool accepted = false;
+            double alpha = 1.0;
+            const double old_merit = merit(current);
+            for (int backtrack = 0; backtrack < 20; ++backtrack, alpha *= 0.5) {
+                array_1d<double,n> next_stress;
+                for (SizeType i = 0; i < n; ++i) next_stress[i] = stress[i] + alpha * stress_scale * step(i,0);
+                const double next_lambda = lambda + alpha * lambda_scale * step(n,0);
+                Evaluation next;
+                if (evaluate(next_stress, next_lambda, next) &&
+                    merit(next) <= (1.0 - 2.0e-4 * alpha) * old_merit) {
+                    stress = next_stress;
+                    lambda = next_lambda;
+                    current = std::move(next);
+                    accepted = true;
+                    break;
+                }
+            }
+            if (!accepted) {
+                result.Failure = IntegrationFailure::LineSearch;
+                return result;
+            }
+            ++result.Iterations;
+        }
+        IntegrationCandidate candidate;
+        candidate.Stress = stress;
+        candidate.PlasticIncrement = lambda * current.Flow.G;
+        candidate.PlasticStrain = rInput.CommittedPlasticStrain + candidate.PlasticIncrement;
+        candidate.P = current.History.P;
+        candidate.DeltaLambda = lambda;
+        candidate.Threshold = current.Threshold;
+        candidate.Hardening = current.Hardening;
+        candidate.EquivalentStress = current.Q;
+        for (double value : candidate.PlasticStrain) {
+            if (!std::isfinite(value)) {
+                result.Failure = IntegrationFailure::NonFiniteState;
+                return result;
+            }
+        }
+        if (rInput.NeedTangent) {
+            Matrix rhs = ZeroMatrix(n + 1, n), solution;
+            for (SizeType i = 0; i < n; ++i)
+                for (SizeType j = 0; j < n; ++j) rhs(i,j) = rInput.ElasticMatrix(i,j) / stress_scale;
+            if (!solve(current.Jacobian, rhs, solution)) {
+                result.Failure = IntegrationFailure::SingularJacobian;
+                return result;
+            }
+            candidate.Tangent = ZeroMatrix(n,n);
+            for (SizeType i = 0; i < n; ++i)
+                for (SizeType j = 0; j < n; ++j) {
+                    const double value = stress_scale * solution(i,j);
+                    if (!std::isfinite(value)) {
+                        result.Failure = IntegrationFailure::NonFiniteState;
+                        return result;
+                    }
+                    (*candidate.Tangent)(i,j) = value;
+                }
+        }
+        result.Status = IntegrationStatus::Converged;
+        result.Candidate = std::move(candidate);
+        return result;
+    }
 
     /// Initialization constructor
     GenericConstitutiveLawIntegratorPlasticity()
